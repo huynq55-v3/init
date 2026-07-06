@@ -1,0 +1,474 @@
+use std::ffi::CString;
+use std::ptr;
+use std::io::{self, Write};
+use std::path::Path;
+use std::process::Command;
+
+fn mount_fs(source: &str, target: &str, fstype: &str, flags: libc::c_ulong) -> Result<(), std::io::Error> {
+    let c_source = CString::new(source)?;
+    let c_target = CString::new(target)?;
+    let c_fstype = CString::new(fstype)?;
+    let res = unsafe {
+        libc::mount(
+            c_source.as_ptr(),
+            c_target.as_ptr(),
+            c_fstype.as_ptr(),
+            flags,
+            ptr::null(),
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn setup_mounts() {
+    println!("[init] Đang chuẩn bị các mount point...");
+    let mounts = [
+        ("proc", "/proc", "proc", 0),
+        ("sysfs", "/sys", "sysfs", 0),
+        ("devtmpfs", "/dev", "devtmpfs", 0),
+        ("devpts", "/dev/pts", "devpts", 0),
+        ("tmpfs", "/tmp", "tmpfs", 0),
+        ("tmpfs", "/run", "tmpfs", 0),
+    ];
+
+    for (source, target, fstype, flags) in mounts.iter() {
+        let path = Path::new(target);
+        if !path.exists() {
+            if let Err(e) = std::fs::create_dir_all(path) {
+                eprintln!("[init] Lỗi tạo thư mục {}: {}", target, e);
+                continue;
+            }
+        }
+        match mount_fs(source, target, fstype, *flags) {
+            Ok(_) => println!("[init] Đã mount {} vào {}", fstype, target),
+            Err(e) => eprintln!("[init] Cảnh báo: Lỗi mount {} vào {}: {}", fstype, target, e),
+        }
+    }
+
+    // Tạo thư mục đặc biệt cho XWayland sockets trong /tmp
+    if let Err(e) = std::fs::create_dir_all("/tmp/.X11-unix") {
+        eprintln!("[init] Lỗi tạo /tmp/.X11-unix: {}", e);
+    } else {
+        unsafe {
+            libc::chmod(b"/tmp/.X11-unix\0".as_ptr() as *const libc::c_char, 0o1777);
+        }
+    }
+}
+
+fn list_processes() {
+    println!("  {:5} {:10} {}", "PID", "STAT", "COMMAND");
+    match std::fs::read_dir("/proc") {
+        Ok(entries) => {
+            for entry in entries {
+                if let Ok(entry) = entry {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.chars().all(|c| c.is_ascii_digit()) {
+                        let pid = &name_str;
+                        let cmdline_path = format!("/proc/{}/cmdline", pid);
+                        let cmd = std::fs::read_to_string(&cmdline_path)
+                            .map(|mut s| {
+                                s.retain(|c| c != '\0');
+                                if s.is_empty() {
+                                    let stat_path = format!("/proc/{}/stat", pid);
+                                    if let Ok(stat) = std::fs::read_to_string(&stat_path) {
+                                        if let Some(start) = stat.find('(') {
+                                            if let Some(end) = stat.find(')') {
+                                                return stat[start+1..end].to_string();
+                                            }
+                                        }
+                                    }
+                                    "unknown".to_string()
+                                } else {
+                                    s
+                                }
+                            })
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        
+                        let stat_path = format!("/proc/{}/stat", pid);
+                        let state = std::fs::read_to_string(&stat_path)
+                            .map(|s| {
+                                let parts: Vec<&str> = s.split_whitespace().collect();
+                                if parts.len() > 2 {
+                                    parts[2].to_string()
+                                } else {
+                                    "-".to_string()
+                                }
+                            })
+                            .unwrap_or_else(|_| "-".to_string());
+
+                        println!("  {:5} {:10} {}", pid, state, cmd);
+                    }
+                }
+            }
+        }
+        Err(e) => eprintln!("ps: Lỗi đọc /proc: {}", e),
+    }
+}
+
+fn run_shell() {
+    println!("\n--- Chào mừng đến với Rust-only User Space OS! ---");
+    println!("Gõ 'help' để xem các lệnh có sẵn.\n");
+
+    loop {
+        let current_dir = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "/".to_string());
+
+        print!("rust-os:{}# ", current_dir);
+        if let Err(e) = io::stdout().flush() {
+            eprintln!("Lỗi stdout flush: {}", e);
+        }
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            eprintln!("Lỗi đọc stdin!");
+            continue;
+        }
+
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        let cmd = parts[0];
+        let args = &parts[1..];
+
+        match cmd {
+            "help" => {
+                println!("Các lệnh có sẵn:");
+                println!("  help            Hiển thị thông báo này");
+                println!("  ls [thư mục]    Liệt kê nội dung thư mục");
+                println!("  cd <thư mục>    Chuyển thư mục làm việc");
+                println!("  pwd             Hiển thị thư mục hiện tại");
+                println!("  cat <file>      Hiển thị nội dung file");
+                println!("  echo [chuỗi]    In ra chuỗi ký tự");
+                println!("  mkdir <thư mục> Tạo thư mục mới");
+                println!("  rm <đường dẫn>  Xóa file hoặc thư mục");
+                println!("  ps              Liệt kê các tiến trình đang chạy");
+                println!("  df              Hiển thị các phân vùng đã mount");
+                println!("  uname           Hiển thị thông tin hệ thống");
+                println!("  reboot          Khởi động lại hệ thống");
+                println!("  poweroff        Tắt máy ảo");
+            }
+            "ls" => {
+                let target = args.first().copied().unwrap_or(".");
+                match std::fs::read_dir(target) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            if let Ok(entry) = entry {
+                                let metadata = entry.metadata();
+                                let file_name = entry.file_name();
+                                let name = file_name.to_string_lossy();
+                                let file_type = if metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                                    "DIR "
+                                } else {
+                                    "FILE"
+                                };
+                                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                                println!("  {} {:10} B  {}", file_type, size, name);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("ls: không thể đọc '{}': {}", target, e),
+                }
+            }
+            "cd" => {
+                if args.is_empty() {
+                    println!("cd: thiếu đường dẫn");
+                } else {
+                    let target = args[0];
+                    if let Err(e) = std::env::set_current_dir(target) {
+                        eprintln!("cd: không thể chuyển đến '{}': {}", target, e);
+                    }
+                }
+            }
+            "pwd" => {
+                println!("{}", current_dir);
+            }
+            "cat" => {
+                if args.is_empty() {
+                    println!("cat: thiếu đường dẫn file");
+                } else {
+                    let target = args[0];
+                    match std::fs::read_to_string(target) {
+                        Ok(content) => print!("{}", content),
+                        Err(e) => eprintln!("cat: không thể đọc '{}': {}", target, e),
+                    }
+                }
+            }
+            "echo" => {
+                println!("{}", args.join(" "));
+            }
+            "mkdir" => {
+                if args.is_empty() {
+                    println!("mkdir: thiếu tên thư mục");
+                } else {
+                    let target = args[0];
+                    if let Err(e) = std::fs::create_dir_all(target) {
+                        eprintln!("mkdir: không thể tạo '{}': {}", target, e);
+                    }
+                }
+            }
+            "rm" => {
+                if args.is_empty() {
+                    println!("rm: thiếu đường dẫn");
+                } else {
+                    let target = args[0];
+                    let path = Path::new(target);
+                    if path.is_dir() {
+                        if let Err(e) = std::fs::remove_dir_all(target) {
+                            eprintln!("rm: không thể xóa thư mục '{}': {}", target, e);
+                        }
+                    } else {
+                        if let Err(e) = std::fs::remove_file(target) {
+                            eprintln!("rm: không thể xóa file '{}': {}", target, e);
+                        }
+                    }
+                }
+            }
+            "uname" => {
+                if let Ok(content) = std::fs::read_to_string("/proc/version") {
+                    print!("{}", content);
+                } else {
+                    println!("Linux (Rust-only User Space OS)");
+                }
+            }
+            "df" => {
+                if let Ok(content) = std::fs::read_to_string("/proc/mounts") {
+                    println!("{}", content);
+                } else {
+                    eprintln!("df: không thể đọc /proc/mounts (bạn đã mount /proc chưa?)");
+                }
+            }
+            "ps" => {
+                list_processes();
+            }
+            "reboot" => {
+                println!("Đang khởi động lại...");
+                unsafe {
+                    libc::reboot(libc::LINUX_REBOOT_CMD_RESTART);
+                }
+            }
+            "poweroff" => {
+                println!("Đang tắt hệ thống...");
+                unsafe {
+                    libc::reboot(libc::LINUX_REBOOT_CMD_POWER_OFF);
+                }
+            }
+            _ => {
+                match Command::new(cmd).args(args).spawn() {
+                    Ok(mut child) => {
+                        if let Err(e) = child.wait() {
+                            eprintln!("{}: lỗi trong khi chạy: {}", cmd, e);
+                        }
+                    }
+                    Err(_) => {
+                        println!("rust-shell: không tìm thấy lệnh: '{}'", cmd);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn start_anvil() {
+    println!("[init] Đang tạo thư mục /run/user/0 cho Wayland...");
+    if let Err(e) = std::fs::create_dir_all("/run/user/0") {
+        eprintln!("[init] Lỗi tạo /run/user/0: {}", e);
+    } else {
+        unsafe {
+            libc::chmod(b"/run/user/0\0".as_ptr() as *const libc::c_char, 0o700);
+        }
+    }
+
+    println!("[init] Khởi chạy Wayland Compositor (Anvil) trên card đồ họa ảo (KMS/DRM)...");
+    
+    // Khởi chạy anvil ở chế độ --tty-udev (direct TTY/DRM/KMS)
+    let mut anvil_cmd = Command::new("/bin/anvil");
+    anvil_cmd.arg("--tty-udev");
+    
+    // Đặt biến môi trường bắt buộc cho Wayland và cấu hình GPU target
+    anvil_cmd.env("ANVIL_DRM_DEVICE", "/dev/dri/card0");
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", "/run/user/0");
+    }
+
+    match anvil_cmd.spawn() {
+        Ok(mut child) => {
+            println!("[init] Anvil Compositor đã khởi động dưới nền với PID {}", child.id());
+            std::thread::spawn(move || {
+                match child.wait() {
+                    Ok(status) => println!("[init] Anvil Compositor đã dừng với trạng thái: {}", status),
+                    Err(e) => eprintln!("[init] Lỗi trong khi chờ Anvil: {}", e),
+                }
+            });
+        }
+        Err(e) => {
+            eprintln!("[init] Lỗi khởi chạy /bin/anvil: {}", e);
+        }
+    }
+}
+
+fn start_test_client() {
+    println!("[init] Đang chuẩn bị chạy test client xdg_map_unmap...");
+    std::thread::spawn(|| {
+        // Đợi 3 giây cho Anvil Compositor khởi động hoàn tất và tạo socket Wayland
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        
+        // Tự động phát hiện socket Wayland thực tế được tạo ra trong /run/user/0
+        let mut wayland_display = "wayland-0".to_string();
+        if let Ok(entries) = std::fs::read_dir("/run/user/0") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("wayland-") && !name.ends_with(".lock") {
+                    wayland_display = name;
+                    break;
+                }
+            }
+        }
+        println!("[init] Đang khởi chạy test client kết nối đến display socket: {}...", wayland_display);
+        
+        let mut client_cmd = Command::new("/bin/test_xdg_map_unmap");
+        // Thiết lập biến môi trường kết nối đến Anvil
+        unsafe {
+            client_cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
+            client_cmd.env("WAYLAND_DISPLAY", &wayland_display);
+        }
+        
+        match client_cmd.spawn() {
+            Ok(mut child) => {
+                println!("[init] Test client đã khởi chạy thành công với PID {}", child.id());
+                if let Err(e) = child.wait() {
+                    eprintln!("[init] Test client dừng với lỗi: {}", e);
+                } else {
+                    println!("[init] Test client đã thoát.");
+                }
+            }
+            Err(e) => {
+                eprintln!("[init] Không thể khởi chạy test client /bin/test_xdg_map_unmap: {}", e);
+            }
+        }
+    });
+}
+
+fn parse_cmdline() -> Option<String> {
+    if let Ok(content) = std::fs::read_to_string("/proc/cmdline") {
+        for token in content.split_whitespace() {
+            if token.starts_with("data_part=") {
+                let part = token.trim_start_matches("data_part=");
+                return Some(part.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn setup_user_storage() {
+    println!("[init] Đang thiết lập thư mục cá nhân và phân vùng lưu trữ cho user 'huy'...");
+
+    // Tạo thư mục /home/huy
+    let home_dir = "/home/huy";
+    if let Err(e) = std::fs::create_dir_all(home_dir) {
+        eprintln!("[init] Lỗi tạo thư mục {}: {}", home_dir, e);
+        return;
+    }
+
+    // Đặt quyền sở hữu /home/huy cho user huy (UID 1000, GID 1000)
+    use std::os::unix::fs::chown;
+    if let Err(e) = chown(home_dir, Some(1000), Some(1000)) {
+        eprintln!("[init] Lỗi chown {} cho user huy: {}", home_dir, e);
+    }
+
+    // Xác định phân vùng cần mount
+    let mut device_to_mount = None;
+
+    // 1. Quét từ kernel cmdline
+    if let Some(cmdline_part) = parse_cmdline() {
+        println!("[init] Phát hiện tham số data_part từ kernel command line: {}", cmdline_part);
+        device_to_mount = Some(cmdline_part);
+    } 
+    // 2. Fallback sang /dev/vda nếu chạy trong QEMU
+    else if std::path::Path::new("/dev/vda").exists() {
+        println!("[init] Không có tham số data_part, phát hiện card đĩa ảo /dev/vda (QEMU). Tự động sử dụng.");
+        device_to_mount = Some("/dev/vda".to_string());
+    }
+
+    if let Some(device) = device_to_mount {
+        println!("[init] Đang mount {} vào {}...", device, home_dir);
+        match mount_fs(&device, home_dir, "ext4", 0) {
+            Ok(_) => {
+                println!("[init] Đã mount thành công {} vào {}", device, home_dir);
+                // Đặt lại quyền sở hữu thư mục home và nội dung bên trong cho user huy
+                if let Err(e) = chown(home_dir, Some(1000), Some(1000)) {
+                    eprintln!("[init] Lỗi chown {} sau khi mount: {}", home_dir, e);
+                }
+                
+                // Tạo file chào mừng mẫu
+                let welcome_file = format!("{}/welcome.txt", home_dir);
+                if let Err(e) = std::fs::write(&welcome_file, "Chào mừng bạn đến với Rust-only User Space OS!\nFile này nằm trên phân vùng ext4 lưu trữ bền vững.\n") {
+                    eprintln!("[init] Không thể tạo file welcome.txt: {}", e);
+                } else {
+                    let _ = chown(&welcome_file, Some(1000), Some(1000));
+                    println!("[init] Đã tạo file welcome.txt thành công.");
+                }
+            }
+            Err(e) => {
+                eprintln!("[init] Cảnh báo: Không thể mount {} vào {}: {}", device, home_dir, e);
+            }
+        }
+    } else {
+        println!("[init] Không tìm thấy phân vùng lưu trữ ext4 phù hợp. Bỏ qua mount.");
+    }
+}
+
+fn load_gpu_module() {
+    println!("[init] Đang nạp module driver đồ họa virtio-gpu...");
+    match Command::new("/bin/modprobe").arg("virtio-gpu").status() {
+        Ok(status) if status.success() => {
+            println!("[init] Đã nạp thành công module virtio-gpu.");
+            // Đợi 1 giây để udev/kernel tạo các node thiết bị trong /dev/dri/
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        Ok(status) => {
+            eprintln!("[init] Lỗi nạp module virtio-gpu: status {}", status);
+        }
+        Err(e) => {
+            eprintln!("[init] Không thể khởi chạy /bin/modprobe: {}", e);
+        }
+    }
+}
+
+fn main() {
+    println!("[init] Tiến trình khởi động bắt đầu (PID 1)...");
+    
+    // Thiết lập các hệ thống file ảo
+    setup_mounts();
+
+    // Nạp driver đồ họa cho card ảo
+    load_gpu_module();
+
+    // Thiết lập thư mục và mount phân vùng dữ liệu cho user huy
+    setup_user_storage();
+
+    // Thiết lập PATH và các biến môi trường cơ bản
+    unsafe {
+        std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin");
+        std::env::set_var("HOME", "/root");
+        std::env::set_var("TERM", "xterm");
+    }
+
+    // Khởi chạy Anvil Compositor
+    start_anvil();
+
+    // Khởi chạy test client Wayland
+    start_test_client();
+
+    // Khởi chạy CLI shell tương tác dự phòng trên console serial
+    run_shell();
+}
