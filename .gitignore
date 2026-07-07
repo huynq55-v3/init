@@ -1,3 +1,6 @@
 /target
 /my-rootfs/
 /initramfs.cpio.gz
+data.img
+.gitignore
+rust-os.iso
