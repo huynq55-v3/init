@@ -289,12 +289,58 @@ fn start_anvil() {
 
     println!("[init] Khởi chạy Wayland Compositor (Anvil) trên card đồ họa ảo (KMS/DRM)...");
     
+    // Tìm card DRM trong /dev/dri/
+    let mut drm_device = "/dev/dri/card0".to_string();
+    if let Ok(entries) = std::fs::read_dir("/dev/dri") {
+        let mut found_cards = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("card") {
+                found_cards.push(format!("/dev/dri/{}", name));
+            }
+        }
+        found_cards.sort();
+        if let Some(card) = found_cards.first() {
+            println!("[init] Tự động phát hiện card DRM: {}", card);
+            drm_device = card.clone();
+        } else {
+            println!("[init] Cảnh báo: Không tìm thấy card nào bắt đầu bằng 'card' trong /dev/dri. Sử dụng mặc định /dev/dri/card0.");
+        }
+    } else {
+        println!("[init] Cảnh báo: Thư mục /dev/dri không tồn tại. Sử dụng mặc định /dev/dri/card0.");
+    }
+
     // Khởi chạy anvil ở chế độ --tty-udev (direct TTY/DRM/KMS)
     let mut anvil_cmd = Command::new("/bin/anvil");
     anvil_cmd.arg("--tty-udev");
     
     // Đặt biến môi trường bắt buộc cho Wayland và cấu hình GPU target
-    anvil_cmd.env("ANVIL_DRM_DEVICE", "/dev/dri/card0");
+    anvil_cmd.env("ANVIL_DRM_DEVICE", &drm_device);
+    
+    // Ép buộc libseat sử dụng builtin backend trực tiếp với quyền root
+    anvil_cmd.env("LIBSEAT_BACKEND", "builtin");
+    
+    // Mở /dev/tty1 làm stdin (controlling terminal) cho Anvil để libseat hoạt động đúng đắn
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty1") {
+        println!("[init] Gán /dev/tty1 làm stdin cho Anvil Compositor.");
+        anvil_cmd.stdin(file);
+    } else {
+        eprintln!("[init] Cảnh báo: Lỗi mở /dev/tty1 làm stdin.");
+    }
+
+    // Ghi log Anvil ra phân vùng lưu trữ bền vững để dễ dàng gỡ lỗi trên host
+    let log_file_path = "/home/huy/anvil.log";
+    match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_file_path) {
+        Ok(log_file) => {
+            println!("[init] Ghi nhật ký Anvil vào {}", log_file_path);
+            anvil_cmd.stdout(log_file.try_clone().unwrap());
+            anvil_cmd.stderr(log_file);
+        }
+        Err(e) => {
+            eprintln!("[init] Không thể tạo file log Anvil: {}. Dùng console mặc định.", e);
+        }
+    }
+
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", "/run/user/0");
     }
@@ -304,8 +350,14 @@ fn start_anvil() {
             println!("[init] Anvil Compositor đã khởi động dưới nền với PID {}", child.id());
             std::thread::spawn(move || {
                 match child.wait() {
-                    Ok(status) => println!("[init] Anvil Compositor đã dừng với trạng thái: {}", status),
-                    Err(e) => eprintln!("[init] Lỗi trong khi chờ Anvil: {}", e),
+                    Ok(status) => {
+                        println!("[init] Anvil Compositor đã dừng với trạng thái: {}", status);
+                        unsafe { libc::sync(); }
+                    }
+                    Err(e) => {
+                        eprintln!("[init] Lỗi trong khi chờ Anvil: {}", e);
+                        unsafe { libc::sync(); }
+                    }
                 }
             });
         }
@@ -341,6 +393,19 @@ fn start_test_client() {
             client_cmd.env("WAYLAND_DISPLAY", &wayland_display);
         }
         
+        // Ghi log client ra phân vùng lưu trữ bền vững để dễ dàng gỡ lỗi trên host
+        let log_file_path = "/home/huy/client.log";
+        match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_file_path) {
+            Ok(log_file) => {
+                println!("[init] Ghi nhật ký test client vào {}", log_file_path);
+                client_cmd.stdout(log_file.try_clone().unwrap());
+                client_cmd.stderr(log_file);
+            }
+            Err(e) => {
+                eprintln!("[init] Không thể tạo file log test client: {}", e);
+            }
+        }
+
         match client_cmd.spawn() {
             Ok(mut child) => {
                 println!("[init] Test client đã khởi chạy thành công với PID {}", child.id());
@@ -401,6 +466,20 @@ fn setup_user_storage() {
 
     if let Some(device) = device_to_mount {
         println!("[init] Đang mount {} vào {}...", device, home_dir);
+        
+        // Vòng lặp chờ thiết bị lưu trữ sẵn sàng (hỗ trợ NVMe/PCIe scan trễ)
+        let device_path = std::path::Path::new(&device);
+        let mut attempts = 0;
+        while !device_path.exists() && attempts < 20 {
+            println!("[init] Thiết bị {} chưa sẵn sàng, đang đợi... (lần {})", device, attempts + 1);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            attempts += 1;
+        }
+
+        if !device_path.exists() {
+            eprintln!("[init] Cảnh báo: Thiết bị {} không xuất hiện sau 10 giây chờ đợi.", device);
+        }
+
         match mount_fs(&device, home_dir, "ext4", 0) {
             Ok(_) => {
                 println!("[init] Đã mount thành công {} vào {}", device, home_dir);
@@ -415,7 +494,8 @@ fn setup_user_storage() {
                     eprintln!("[init] Không thể tạo file welcome.txt: {}", e);
                 } else {
                     let _ = chown(&welcome_file, Some(1000), Some(1000));
-                    println!("[init] Đã tạo file welcome.txt thành công.");
+                    unsafe { libc::sync(); }
+                    println!("[init] Đã tạo và đồng bộ file welcome.txt thành công.");
                 }
             }
             Err(e) => {
@@ -428,20 +508,43 @@ fn setup_user_storage() {
 }
 
 fn load_gpu_module() {
-    println!("[init] Đang nạp module driver đồ họa virtio-gpu...");
-    match Command::new("/bin/modprobe").arg("virtio-gpu").status() {
-        Ok(status) if status.success() => {
-            println!("[init] Đã nạp thành công module virtio-gpu.");
-            // Đợi 1 giây để udev/kernel tạo các node thiết bị trong /dev/dri/
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-        Ok(status) => {
-            eprintln!("[init] Lỗi nạp module virtio-gpu: status {}", status);
-        }
-        Err(e) => {
-            eprintln!("[init] Không thể khởi chạy /bin/modprobe: {}", e);
+    let modules = [
+        // Storage drivers (nạp trước để nhận diện ổ cứng nhanh nhất)
+        "vmd", // Cần nạp VMD trước để nhận diện SSD NVMe nằm sau controller Intel VMD
+        "nvme",
+        "ahci",
+        "sdhci",
+        "sdhci-pci",
+        // Input drivers
+        "psmouse",
+        "usbhid",
+        "hid-generic",
+        "i2c-hid-acpi",
+        "hid-multitouch",
+        // GPU drivers
+        "virtio-gpu",
+        "i915",
+        "xe",
+        "amdgpu",
+        "nouveau",
+    ];
+    for module in &modules {
+        println!("[init] Đang nạp module driver {}...", module);
+        match Command::new("/bin/modprobe").arg(module).status() {
+            Ok(status) if status.success() => {
+                println!("[init] Đã nạp thành công module {}.", module);
+            }
+            Ok(status) => {
+                println!("[init] Bỏ qua module {} (status {}).", module, status);
+            }
+            Err(e) => {
+                eprintln!("[init] Không thể khởi chạy /bin/modprobe cho module {}: {}", module, e);
+            }
         }
     }
+    // Đợi 2 giây để udev/kernel tạo các node thiết bị trong /dev/dri/ và /dev/input/
+    println!("[init] Đang đợi thiết bị đồ họa và nhập liệu sẵn sàng...");
+    std::thread::sleep(std::time::Duration::from_secs(2));
 }
 
 fn main() {
