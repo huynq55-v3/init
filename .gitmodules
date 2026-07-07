@@ -1,0 +1,3 @@
+[submodule "apps/smithay"]
+	path = apps/smithay
+	url = /tmp/smithay
