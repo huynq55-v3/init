@@ -521,6 +521,9 @@ fn load_gpu_module() {
         "hid-generic",
         "i2c-hid-acpi",
         "hid-multitouch",
+        "intel-lpss-pci",
+        "intel-lpss-acpi",
+        "i2c-designware-pci",
         // GPU drivers
         "virtio-gpu",
         "i915",
@@ -545,6 +548,26 @@ fn load_gpu_module() {
     // Đợi 2 giây để udev/kernel tạo các node thiết bị trong /dev/dri/ và /dev/input/
     println!("[init] Đang đợi thiết bị đồ họa và nhập liệu sẵn sàng...");
     std::thread::sleep(std::time::Duration::from_secs(2));
+
+    println!("[init] --- Danh sách các thiết bị đầu vào trong /dev/input ---");
+    if let Ok(entries) = std::fs::read_dir("/dev/input") {
+        for entry in entries.flatten() {
+            println!("[init]   - {:?}", entry.path());
+        }
+    } else {
+        println!("[init]   Thư mục /dev/input không tồn tại hoặc rỗng!");
+    }
+
+    println!("[init] --- Danh sách thiết bị đầu vào từ kernel (/proc/bus/input/devices) ---");
+    if let Ok(content) = std::fs::read_to_string("/proc/bus/input/devices") {
+        for line in content.lines() {
+            if line.starts_with("I:") || line.starts_with("N:") || line.starts_with("H:") {
+                println!("[init]   {}", line);
+            }
+        }
+    } else {
+        println!("[init]   Không thể đọc /proc/bus/input/devices");
+    }
 }
 
 fn main() {
@@ -555,6 +578,25 @@ fn main() {
 
     // Nạp driver đồ họa cho card ảo
     load_gpu_module();
+
+    // Khởi chạy udev daemon để quản lý nóng thiết bị đầu vào (chuột, bàn phím, touchpad)
+    println!("[init] Khởi chạy udev daemon...");
+    match Command::new("/lib/systemd/systemd-udevd").arg("--daemon").status() {
+        Ok(status) if status.success() => {
+            println!("[init] Đã khởi chạy systemd-udevd dưới dạng daemon.");
+            // Phát sự kiện add để udev quét và nhận diện các thiết bị đã kết nối sẵn
+            let _ = Command::new("/bin/udevadm").args(&["trigger", "--action=add"]).status();
+            // Đợi udev xử lý xong toàn bộ các sự kiện quét thiết bị
+            let _ = Command::new("/bin/udevadm").arg("settle").status();
+            println!("[init] udevadm đã quét và cấu hình xong các thiết bị.");
+        }
+        Ok(status) => {
+            eprintln!("[init] Cảnh báo: systemd-udevd khởi chạy thất bại với status: {}", status);
+        }
+        Err(e) => {
+            eprintln!("[init] Lỗi khởi chạy udev daemon: {}", e);
+        }
+    }
 
     // Thiết lập thư mục và mount phân vùng dữ liệu cho user huy
     setup_user_storage();

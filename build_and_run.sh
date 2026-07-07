@@ -197,6 +197,9 @@ copy_module_with_deps hid-generic
 copy_module_with_deps psmouse
 copy_module_with_deps i2c-hid-acpi
 copy_module_with_deps hid-multitouch
+copy_module_with_deps intel-lpss-pci
+copy_module_with_deps intel-lpss-acpi
+copy_module_with_deps i2c-designware-pci
 
 # Copy các module lưu trữ chính (NVMe SSD, SATA/AHCI HDD/SSD, SD Card, VMD Controller)
 copy_module_with_deps nvme
@@ -212,6 +215,43 @@ ln -sf kmod my-rootfs/bin/depmod
 
 # Quét dependency cho kmod để copy các thư viện .so cần thiết
 copy_deps my-rootfs/bin/kmod my-rootfs
+
+# Copy udev daemon và udevadm cho việc quản lý nóng thiết bị đầu vào (chuột/bàn phím)
+mkdir -p my-rootfs/lib/systemd
+cp -L /lib/systemd/systemd-udevd my-rootfs/lib/systemd/systemd-udevd
+cp -L /usr/bin/udevadm my-rootfs/bin/udevadm
+
+# Copy dependencies của udevd và udevadm
+copy_deps my-rootfs/lib/systemd/systemd-udevd my-rootfs
+copy_deps my-rootfs/bin/udevadm my-rootfs
+
+# Copy libkmod.so.2 thủ công vì udevadm/udevd sử dụng dlopen để load nó
+mkdir -p my-rootfs/usr/lib/x86_64-linux-gnu
+cp -L /usr/lib/x86_64-linux-gnu/libkmod.so.2 my-rootfs/usr/lib/x86_64-linux-gnu/
+
+# Copy các rules của udev và hwdb vào cả /usr/lib/udev và /lib/udev để tương thích hoàn toàn
+mkdir -p my-rootfs/usr/lib/udev/rules.d
+mkdir -p my-rootfs/lib/udev/rules.d
+
+# Copy udev rules
+cp -rL /lib/udev/rules.d/* my-rootfs/usr/lib/udev/rules.d/
+cp -rL /lib/udev/rules.d/* my-rootfs/lib/udev/rules.d/
+
+# Copy hwdb.bin
+if [ -f /lib/udev/hwdb.bin ]; then
+    cp -L /lib/udev/hwdb.bin my-rootfs/usr/lib/udev/hwdb.bin
+    cp -L /lib/udev/hwdb.bin my-rootfs/lib/udev/hwdb.bin
+elif [ -f /usr/lib/udev/hwdb.bin ]; then
+    cp -L /usr/lib/udev/hwdb.bin my-rootfs/usr/lib/udev/hwdb.bin
+    cp -L /usr/lib/udev/hwdb.bin my-rootfs/lib/udev/hwdb.bin
+fi
+
+# Thêm rule udev bắt buộc gán nhãn seat0
+cat << 'EOF' > my-rootfs/usr/lib/udev/rules.d/99-seat0.rules
+SUBSYSTEM=="input", KERNEL=="input*", TAG+="seat0", ENV{ID_SEAT}="seat0"
+SUBSYSTEM=="drm", KERNEL=="card*", TAG+="seat0", ENV{ID_SEAT}="seat0"
+EOF
+cp my-rootfs/usr/lib/udev/rules.d/99-seat0.rules my-rootfs/lib/udev/rules.d/99-seat0.rules
 
 # Chạy depmod trên host để thiết lập index danh sách phụ thuộc cho các module trong rootfs
 depmod -b my-rootfs "$KVER"
