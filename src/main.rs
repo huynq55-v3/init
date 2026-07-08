@@ -434,7 +434,8 @@ fn start_desktop_services() {
             Err(e) => eprintln!("[init] Lỗi khởi chạy rust-dock: {}", e),
         }
 
-        // 3. Khởi chạy test client xdg_map_unmap
+        // 3. Khởi chạy test client xdg_map_unmap (Đã tắt theo yêu cầu bỏ app TC)
+        /*
         println!("[init] Khởi chạy test client kết nối đến display socket: {}...", wayland_display);
         let mut client_cmd = Command::new("/bin/test_xdg_map_unmap");
         unsafe {
@@ -456,6 +457,7 @@ fn start_desktop_services() {
             }
             Err(e) => eprintln!("[init] Lỗi khởi chạy test client: {}", e),
         }
+        */
     });
 }
 

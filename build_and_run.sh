@@ -80,6 +80,18 @@ version = "1.0.0"
 EOF
 fi
 
+# Tạo lệnh sudo giả lập (wrapper)
+echo "Tạo lệnh sudo giả lập..."
+cat << 'EOF' > my-rootfs/bin/sudo
+#!/bin/sh
+if [ $# -eq 0 ]; then
+    echo "usage: sudo command [args...]"
+    exit 1
+fi
+exec "$@"
+EOF
+chmod +x my-rootfs/bin/sudo
+
 # Tích hợp BusyBox để có đầy đủ các lệnh UNIX chuẩn (ls, cat, mkdir...)
 echo "Tích hợp BusyBox và tạo các lệnh UNIX chuẩn..."
 cp /usr/bin/busybox my-rootfs/bin/busybox
