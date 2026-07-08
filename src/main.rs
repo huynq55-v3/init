@@ -57,6 +57,21 @@ fn setup_mounts() {
             libc::chmod(b"/tmp/.X11-unix\0".as_ptr() as *const libc::c_char, 0o1777);
         }
     }
+
+    // Đảm bảo quyền truy cập cho /dev/ptmx là 0666 để user thường có thể mở PTY
+    let ptmx_path = "/dev/ptmx";
+    if Path::new(ptmx_path).exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(ptmx_path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o666);
+            if let Err(e) = std::fs::set_permissions(ptmx_path, perms) {
+                eprintln!("[init] Cảnh báo: Lỗi chmod /dev/ptmx: {}", e);
+            } else {
+                println!("[init] Đã thiết lập quyền 0666 cho /dev/ptmx");
+            }
+        }
+    }
 }
 
 fn list_processes() {
@@ -367,8 +382,8 @@ fn start_anvil() {
     }
 }
 
-fn start_test_client() {
-    println!("[init] Đang chuẩn bị chạy test client xdg_map_unmap...");
+fn start_desktop_services() {
+    println!("[init] Đang chuẩn bị chạy các dịch vụ giao diện (app-manager, rust-dock, test client)...");
     std::thread::spawn(|| {
         // Đợi 3 giây cho Anvil Compositor khởi động hoàn tất và tạo socket Wayland
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -384,40 +399,62 @@ fn start_test_client() {
                 }
             }
         }
-        println!("[init] Đang khởi chạy test client kết nối đến display socket: {}...", wayland_display);
-        
+
+        // 1. Khởi chạy app-manager daemon
+        println!("[init] Khởi chạy app-manager daemon...");
+        let mut manager_cmd = Command::new("/bin/app-manager");
+        manager_cmd.arg("daemon");
+        unsafe {
+            manager_cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
+        }
+        let manager_log_path = "/home/huy/app-manager.log";
+        if let Ok(log_file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(manager_log_path) {
+            manager_cmd.stdout(log_file.try_clone().unwrap());
+            manager_cmd.stderr(log_file);
+        }
+        match manager_cmd.spawn() {
+            Ok(child) => println!("[init] app-manager daemon đã khởi chạy với PID {}", child.id()),
+            Err(e) => eprintln!("[init] Lỗi khởi chạy app-manager daemon: {}", e),
+        }
+
+        // 2. Khởi chạy thanh Dock (rust-dock)
+        println!("[init] Khởi chạy thanh Dock (rust-dock)...");
+        let mut dock_cmd = Command::new("/bin/rust-dock");
+        unsafe {
+            dock_cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
+            dock_cmd.env("WAYLAND_DISPLAY", &wayland_display);
+        }
+        let dock_log_path = "/home/huy/dock.log";
+        if let Ok(log_file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(dock_log_path) {
+            dock_cmd.stdout(log_file.try_clone().unwrap());
+            dock_cmd.stderr(log_file);
+        }
+        match dock_cmd.spawn() {
+            Ok(child) => println!("[init] rust-dock đã khởi chạy với PID {}", child.id()),
+            Err(e) => eprintln!("[init] Lỗi khởi chạy rust-dock: {}", e),
+        }
+
+        // 3. Khởi chạy test client xdg_map_unmap
+        println!("[init] Khởi chạy test client kết nối đến display socket: {}...", wayland_display);
         let mut client_cmd = Command::new("/bin/test_xdg_map_unmap");
-        // Thiết lập biến môi trường kết nối đến Anvil
         unsafe {
             client_cmd.env("XDG_RUNTIME_DIR", "/run/user/0");
             client_cmd.env("WAYLAND_DISPLAY", &wayland_display);
         }
-        
-        // Ghi log client ra phân vùng lưu trữ bền vững để dễ dàng gỡ lỗi trên host
-        let log_file_path = "/home/huy/client.log";
-        match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(log_file_path) {
-            Ok(log_file) => {
-                println!("[init] Ghi nhật ký test client vào {}", log_file_path);
-                client_cmd.stdout(log_file.try_clone().unwrap());
-                client_cmd.stderr(log_file);
-            }
-            Err(e) => {
-                eprintln!("[init] Không thể tạo file log test client: {}", e);
-            }
+        let client_log_path = "/home/huy/client.log";
+        if let Ok(log_file) = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(client_log_path) {
+            client_cmd.stdout(log_file.try_clone().unwrap());
+            client_cmd.stderr(log_file);
         }
-
         match client_cmd.spawn() {
             Ok(mut child) => {
                 println!("[init] Test client đã khởi chạy thành công với PID {}", child.id());
-                if let Err(e) = child.wait() {
-                    eprintln!("[init] Test client dừng với lỗi: {}", e);
-                } else {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
                     println!("[init] Test client đã thoát.");
-                }
+                });
             }
-            Err(e) => {
-                eprintln!("[init] Không thể khởi chạy test client /bin/test_xdg_map_unmap: {}", e);
-            }
+            Err(e) => eprintln!("[init] Lỗi khởi chạy test client: {}", e),
         }
     });
 }
@@ -611,8 +648,8 @@ fn main() {
     // Khởi chạy Anvil Compositor
     start_anvil();
 
-    // Khởi chạy test client Wayland
-    start_test_client();
+    // Khởi chạy các dịch vụ giao diện (app-manager, rust-dock, test client)
+    start_desktop_services();
 
     // Khởi chạy CLI shell tương tác dự phòng trên console serial
     run_shell();

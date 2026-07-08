@@ -49,6 +49,49 @@ else
     exit 1
 fi
 
+# Copy app-manager và rust-dock
+if [ -f apps/smithay/target/release/app_manager ]; then
+    echo "Đã tìm thấy app-manager tại apps/smithay/target/release/app_manager"
+    cp apps/smithay/target/release/app_manager my-rootfs/bin/app-manager
+    chmod +x my-rootfs/bin/app-manager
+fi
+
+if [ -f apps/smithay/target/release/rust_dock ]; then
+    echo "Đã tìm thấy rust-dock tại apps/smithay/target/release/rust_dock"
+    cp apps/smithay/target/release/rust_dock my-rootfs/bin/rust-dock
+    chmod +x my-rootfs/bin/rust-dock
+fi
+
+if [ -f apps/smithay/target/release/rust_terminal ]; then
+    echo "Đã tìm thấy rust-terminal tại apps/smithay/target/release/rust_terminal"
+    cp apps/smithay/target/release/rust_terminal my-rootfs/bin/rust-terminal
+    chmod +x my-rootfs/bin/rust-terminal
+
+    # Tạo App Bundle cho rust-terminal để được quét bởi app-manager
+    echo "Tạo App Bundle cho rust-terminal tại my-rootfs/apps/rust_terminal..."
+    mkdir -p my-rootfs/apps/rust_terminal
+    cat << 'EOF' > my-rootfs/apps/rust_terminal/app.toml
+[application]
+name = "Terminal"
+exec = "/bin/rust-terminal"
+icon = ""
+category = "System"
+version = "1.0.0"
+EOF
+fi
+
+# Tích hợp BusyBox để có đầy đủ các lệnh UNIX chuẩn (ls, cat, mkdir...)
+echo "Tích hợp BusyBox và tạo các lệnh UNIX chuẩn..."
+cp /usr/bin/busybox my-rootfs/bin/busybox
+chmod +x my-rootfs/bin/busybox
+
+# Tạo các link lệnh chuẩn trỏ về busybox dạng relative (bỏ qua chính busybox)
+for cmd in $(my-rootfs/bin/busybox --list); do
+    if [ "$cmd" != "busybox" ]; then
+        ln -sf busybox my-rootfs/bin/$cmd
+    fi
+done
+
 # Tạo một file văn bản nhỏ trong rootfs để test lệnh 'cat'
 echo "Xin chào! Đây là file test nằm trong Rust user space." > my-rootfs/root/hello.txt
 
@@ -76,10 +119,13 @@ copy_deps() {
     done
 }
 
-# Sao chép các dependency cho init, anvil và test client
+# Sao chép các dependency cho các binary
 copy_deps my-rootfs/init my-rootfs
 copy_deps my-rootfs/bin/anvil my-rootfs
 copy_deps my-rootfs/bin/test_xdg_map_unmap my-rootfs
+copy_deps my-rootfs/bin/app-manager my-rootfs
+copy_deps my-rootfs/bin/rust-dock my-rootfs
+copy_deps my-rootfs/bin/rust-terminal my-rootfs
 
 # Copy thêm libseat.so.1 thủ công (vì nó nằm trong thư mục build tạm của chúng ta)
 if [ -f /tmp/local_libs/usr/lib/x86_64-linux-gnu/libseat.so.1 ]; then
